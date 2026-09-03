@@ -13,7 +13,7 @@ services:
       - key: VIRTUAL_CAPITAL
         value: "406"
       - key: MAX_NOTIONAL
-        value: "75"
+        value: "350"
       - key: MAX_DAILY_LOSS
         value: "4.06"
       - key: MAX_TRADES_PER_DAY
@@ -24,4 +24,3 @@ services:
         sync: false
       - key: APCA_API_SECRET_KEY
         sync: false
-
