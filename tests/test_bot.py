@@ -46,6 +46,7 @@ def test_order_is_paper_bracket_with_bounded_loss():
     assert payload["order_class"] == "bracket"
     assert payload["extended_hours"] is False
     assert payload["client_order_id"].startswith("eli406-")
+    assert payload["qty"] == "1"
     notional = float(payload["qty"]) * float(payload["limit_price"])
     planned_loss = float(payload["qty"]) * (
         float(payload["limit_price"]) - float(payload["stop_loss"]["stop_price"])
@@ -53,3 +54,12 @@ def test_order_is_paper_bracket_with_bounded_loss():
     assert notional <= cfg.max_notional + 0.01
     assert planned_loss <= cfg.max_daily_loss / 2
 
+
+def test_expensive_etf_cannot_bypass_notional_cap():
+    cfg = Config()
+    pilot = PaperPilot(cfg)
+    with pytest.raises(ValueError):
+        pilot._order_payload(
+            {"symbol": "QQQ", "price": 700.0, "volume_ratio": 2.0},
+            datetime(2026, 9, 3, 10, 30, tzinfo=ZoneInfo("America/New_York")),
+        )
