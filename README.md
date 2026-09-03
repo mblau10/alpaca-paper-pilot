@@ -2,7 +2,7 @@
 
 This service scans SPY, QQQ, IWM, SMH, and XLE once per minute during regular U.S. market hours. It is intentionally hard-coded to Alpaca's paper endpoint and cannot place live orders.
 
-The pilot is designed around a simulated $406 account even though Alpaca displays $100,000 of paper buying power. It trades at most one position at a time, caps each entry at $75 notional, stops at six entries per day, and will not enter when any unrelated position or order exists.
+The pilot is designed around a simulated $406 account even though Alpaca displays $100,000 of paper buying power. It trades at most one position at a time, caps each entry at $350 notional while keeping the planned loss at no more than $2.03, stops at six entries per day, and will not enter when any unrelated position or order exists.
 
 ## Signal
 
