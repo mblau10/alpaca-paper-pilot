@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: eli-alpaca-paper-pilot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeploy: false
+    envVars:
+      - key: PAPER_ORDERS_ENABLED
+        value: "true"
+      - key: VIRTUAL_CAPITAL
+        value: "406"
+      - key: MAX_NOTIONAL
+        value: "75"
+      - key: MAX_DAILY_LOSS
+        value: "4.06"
+      - key: MAX_TRADES_PER_DAY
+        value: "6"
+      - key: SCAN_SECONDS
+        value: "60"
+      - key: APCA_API_KEY_ID
+        sync: false
+      - key: APCA_API_SECRET_KEY
+        sync: false
+
