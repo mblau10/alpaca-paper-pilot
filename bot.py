@@ -38,7 +38,7 @@ class Config:
     api_secret: str = field(default_factory=lambda: os.getenv("APCA_API_SECRET_KEY", ""))
     orders_enabled: bool = field(default_factory=lambda: env_bool("PAPER_ORDERS_ENABLED", False))
     virtual_capital: float = field(default_factory=lambda: env_float("VIRTUAL_CAPITAL", 406.0))
-    max_notional: float = field(default_factory=lambda: env_float("MAX_NOTIONAL", 75.0))
+    max_notional: float = field(default_factory=lambda: env_float("MAX_NOTIONAL", 350.0))
     max_daily_loss: float = field(default_factory=lambda: env_float("MAX_DAILY_LOSS", 4.06))
     max_trades: int = field(default_factory=lambda: env_int("MAX_TRADES_PER_DAY", 6))
     scan_seconds: int = field(default_factory=lambda: env_int("SCAN_SECONDS", 60))
@@ -52,8 +52,8 @@ class Config:
     symbols: tuple[str, ...] = ("SPY", "QQQ", "IWM", "SMH", "XLE")
 
     def validate(self) -> None:
-        if self.max_notional > self.virtual_capital * 0.25:
-            raise ValueError("MAX_NOTIONAL must be no more than 25% of VIRTUAL_CAPITAL")
+        if self.max_notional > self.virtual_capital * 0.90:
+            raise ValueError("MAX_NOTIONAL must be no more than 90% of VIRTUAL_CAPITAL")
         if self.max_daily_loss > self.virtual_capital * 0.01 + 1e-9:
             raise ValueError("MAX_DAILY_LOSS must be no more than 1% of VIRTUAL_CAPITAL")
         if self.max_trades > 6:
@@ -221,6 +221,7 @@ class PaperPilot:
             "orders_enabled": self.config.orders_enabled,
             "virtual_capital": self.config.virtual_capital,
             "max_notional": self.config.max_notional,
+            "max_planned_loss_per_trade": self.config.max_daily_loss / 2,
             "max_daily_loss": self.config.max_daily_loss,
             "max_trades_per_day": self.config.max_trades,
             "symbols": self.config.symbols,
