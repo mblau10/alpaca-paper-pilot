@@ -81,6 +81,14 @@ class Alpaca:
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         response = await self.http.request(method, url, headers=self.headers, **kwargs)
+        if response.is_error:
+            LOG.error(
+                "alpaca api error method=%s url=%s status=%s body=%s",
+                method,
+                url,
+                response.status_code,
+                response.text[:1000],
+            )
         response.raise_for_status()
         if response.status_code == 204:
             return None
@@ -308,7 +316,19 @@ class PaperPilot:
             self._paused_reason = "no_confirmed_breakout"
             return
 
-        signal = max(candidates, key=lambda item: item["volume_ratio"])
+        # Alpaca does not accept fractional quantities for advanced bracket
+        # orders. Keep the pilot protected by using whole shares only and skip
+        # any candidate that cannot fit inside the configured notional cap.
+        affordable = [
+            item
+            for item in candidates
+            if tick(float(item["price"]) * 1.0005) <= self.config.max_notional
+        ]
+        if not affordable:
+            self._paused_reason = "no_affordable_whole_share_candidate"
+            return
+
+        signal = max(affordable, key=lambda item: item["volume_ratio"])
         self._last_signal = signal
         if not self.config.orders_enabled:
             self._paused_reason = "dry_run_signal_only"
@@ -331,7 +351,7 @@ class PaperPilot:
         limit_price = tick(price * 1.0005)
         stop_price = tick(limit_price * (1 - self.config.stop_pct))
         target_price = tick(limit_price * (1 + self.config.target_pct))
-        qty = math.floor((self.config.max_notional / limit_price) * 1_000_000) / 1_000_000
+        qty = math.floor(self.config.max_notional / limit_price)
         if qty <= 0 or qty * limit_price > self.config.max_notional + 0.01:
             raise ValueError("calculated quantity violates notional cap")
         planned_loss = qty * (limit_price - stop_price)
@@ -340,7 +360,7 @@ class PaperPilot:
         tag = now.strftime("eli406-%Y%m%d-%H%M%S")
         return {
             "symbol": signal["symbol"],
-            "qty": f"{qty:.6f}",
+            "qty": str(qty),
             "side": "buy",
             "type": "limit",
             "time_in_force": "day",
