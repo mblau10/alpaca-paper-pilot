@@ -30,9 +30,14 @@ def test_signal_rejects_weak_volume():
 
 
 def test_config_rejects_oversized_notional(monkeypatch):
-    monkeypatch.setenv("MAX_NOTIONAL", "200")
+    monkeypatch.setenv("MAX_NOTIONAL", "400")
     with pytest.raises(ValueError):
         Config().validate()
+
+
+def test_config_allows_stop_bounded_whole_share_trade(monkeypatch):
+    monkeypatch.setenv("MAX_NOTIONAL", "350")
+    Config().validate()
 
 
 def test_order_is_paper_bracket_with_bounded_loss():
@@ -46,7 +51,7 @@ def test_order_is_paper_bracket_with_bounded_loss():
     assert payload["order_class"] == "bracket"
     assert payload["extended_hours"] is False
     assert payload["client_order_id"].startswith("eli406-")
-    assert payload["qty"] == "1"
+    assert payload["qty"] == "5"
     notional = float(payload["qty"]) * float(payload["limit_price"])
     planned_loss = float(payload["qty"]) * (
         float(payload["limit_price"]) - float(payload["stop_loss"]["stop_price"])
