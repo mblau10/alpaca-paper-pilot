@@ -52,6 +52,14 @@ class Config:
     symbols: tuple[str, ...] = ("SPY", "QQQ", "IWM", "SMH", "XLE")
 
     def validate(self) -> None:
+        for name in ("virtual_capital", "max_notional", "max_daily_loss", "stop_pct", "target_pct", "min_volume_ratio"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if not 1 <= self.max_trades <= 6 or self.scan_seconds < 30 or self.cooldown_minutes < 30:
+            raise ValueError("invalid trade count, scan interval, or cooldown")
+        if self.stop_pct >= 1:
+            raise ValueError("STOP_PCT must be below 1")
         if self.max_notional > self.virtual_capital * 0.90:
             raise ValueError("MAX_NOTIONAL must be no more than 90% of VIRTUAL_CAPITAL")
         if self.max_daily_loss > self.virtual_capital * 0.01 + 1e-9:
@@ -105,7 +113,10 @@ class Alpaca:
 
     async def orders(self, status: str = "open", nested: bool = True) -> list[dict[str, Any]]:
         params = {"status": status, "nested": str(nested).lower(), "limit": 500, "direction": "desc"}
-        return await self._request("GET", f"{PAPER_TRADING_URL}/v2/orders", params=params)
+        result = await self._request("GET", f"{PAPER_TRADING_URL}/v2/orders", params=params)
+        if len(result) >= 500:
+            raise ValueError("order history may be truncated")
+        return result
 
     async def today_orders(self) -> list[dict[str, Any]]:
         start = datetime.now(NY).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -116,7 +127,10 @@ class Alpaca:
             "direction": "desc",
             "after": start.astimezone(timezone.utc).isoformat(),
         }
-        return await self._request("GET", f"{PAPER_TRADING_URL}/v2/orders", params=params)
+        result = await self._request("GET", f"{PAPER_TRADING_URL}/v2/orders", params=params)
+        if len(result) >= 500:
+            raise ValueError("order history may be truncated")
+        return result
 
     async def bars(self, start: datetime, end: datetime) -> dict[str, list[dict[str, Any]]]:
         params = {
@@ -129,8 +143,20 @@ class Alpaca:
             "feed": "iex",
             "sort": "asc",
         }
-        data = await self._request("GET", f"{DATA_URL}/v2/stocks/bars", params=params)
-        return data.get("bars", {})
+        result: dict[str, list[dict[str, Any]]] = {}
+        seen = set()
+        for _ in range(20):
+            data = await self._request("GET", f"{DATA_URL}/v2/stocks/bars", params=params)
+            for symbol, bars in data.get("bars", {}).items():
+                result.setdefault(symbol, []).extend(bars)
+            token = data.get("next_page_token")
+            if not token:
+                return result
+            if token in seen:
+                raise ValueError("repeated market-data page token")
+            seen.add(token)
+            params["page_token"] = token
+        raise ValueError("market-data pagination incomplete")
 
     async def submit_bracket(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", f"{PAPER_TRADING_URL}/v2/orders", json=payload)
@@ -167,6 +193,36 @@ def vwap(bars: list[dict[str, Any]]) -> float:
 
 def tick(price: float) -> float:
     return round(price + 1e-9, 2)
+
+
+def parse_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include timezone")
+    return parsed
+
+
+def completed_bars(bars: list[dict[str, Any]], start: datetime, now: datetime) -> list[dict[str, Any]]:
+    cutoff = now.replace(second=0, microsecond=0)
+    by_time = {parse_time(bar["t"]): bar for bar in bars}
+    result = [bar for stamp, bar in sorted(by_time.items()) if start <= stamp < cutoff]
+    if not result or now - parse_time(result[-1]["t"]) > timedelta(minutes=2):
+        raise ValueError("stale or missing completed market data")
+    for bar in result:
+        if any(not math.isfinite(float(bar[k])) or float(bar[k]) <= 0 for k in ("o", "h", "l", "c")):
+            raise ValueError("invalid bar price")
+        if not math.isfinite(float(bar["v"])) or float(bar["v"]) < 0:
+            raise ValueError("invalid bar volume")
+    return result
+
+
+def flatten_orders(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique = {}
+    for order in orders:
+        unique[str(order["id"])] = order
+        for leg in order.get("legs") or []:
+            unique[str(leg["id"])] = leg
+    return list(unique.values())
 
 
 def analyze(symbol: str, bars: list[dict[str, Any]], config: Config) -> dict[str, Any] | None:
@@ -218,6 +274,7 @@ class PaperPilot:
     def public_status(self) -> dict[str, Any]:
         return {
             "mode": "paper-only",
+            "revision": os.getenv("RENDER_GIT_COMMIT", "local"),
             "orders_enabled": self.config.orders_enabled,
             "virtual_capital": self.config.virtual_capital,
             "max_notional": self.config.max_notional,
@@ -238,6 +295,7 @@ class PaperPilot:
                 try:
                     await self.scan_once()
                     self._last_error = None
+                    LOG.info("scan complete mode=paper-only state=%s", self._paused_reason)
                 except Exception as exc:  # keep service alive but fail closed
                     self._last_error = f"{type(exc).__name__}: {exc}"
                     self._paused_reason = "error_fail_closed"
@@ -274,11 +332,16 @@ class PaperPilot:
 
         current_time = now.time().replace(tzinfo=None)
         tagged = self._tagged_parents(today_orders, now)
-        if current_time >= self.config.flatten_time:
+        next_close = parse_time(clock["next_close"]).astimezone(NY)
+        if next_close.date() != now.date():
+            raise ValueError("broker session date mismatch")
+        flatten_at = min(now.replace(hour=self.config.flatten_time.hour, minute=self.config.flatten_time.minute, second=0, microsecond=0), next_close - timedelta(minutes=15))
+        last_entry_at = min(now.replace(hour=self.config.last_entry.hour, minute=self.config.last_entry.minute, second=0, microsecond=0), next_close - timedelta(minutes=60))
+        if now >= flatten_at:
             await self._flatten_tagged(tagged, positions, open_orders)
             self._paused_reason = "flatten_window"
             return
-        if current_time < self.config.entry_start or current_time > self.config.last_entry:
+        if current_time < self.config.entry_start or now > last_entry_at:
             self._paused_reason = "outside_entry_window"
             return
         if positions or open_orders:
@@ -287,16 +350,19 @@ class PaperPilot:
         if len(tagged) >= self.config.max_trades:
             self._paused_reason = "daily_trade_limit"
             return
-        pnl = self._tagged_pnl(tagged, positions)
+        pnl = self._tagged_pnl(tagged, positions, today_orders)
         if pnl <= -self.config.max_daily_loss:
             self._paused_reason = "daily_loss_limit"
             return
+        if tagged:
+            self._last_entry_at = max([parse_time(order["created_at"]) for order in tagged] + ([self._last_entry_at] if self._last_entry_at else []))
         if self._last_entry_at and now - self._last_entry_at < timedelta(minutes=self.config.cooldown_minutes):
             self._paused_reason = "cooldown"
             return
 
         start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        bars_by_symbol = await self.alpaca.bars(start, now)
+        bars_by_symbol = await self.alpaca.bars(start, now.replace(second=0, microsecond=0) - timedelta(microseconds=1))
+        bars_by_symbol = {symbol: completed_bars(bars_by_symbol.get(symbol, []), start, now) for symbol in self.config.symbols}
         if not bars_by_symbol:
             self._paused_reason = "market_data_unavailable"
             return
@@ -336,8 +402,22 @@ class PaperPilot:
             return
 
         payload = self._order_payload(signal, now)
-        order = await self.alpaca.submit_bracket(payload)
+        planned_loss = float(payload["qty"]) * (float(payload["limit_price"]) - float(payload["stop_loss"]["stop_price"]))
+        if planned_loss > max(0.0, self.config.max_daily_loss + min(0.0, pnl)):
+            self._paused_reason = "remaining_daily_risk_insufficient"
+            return
+        if datetime.now(NY) - now > timedelta(seconds=30):
+            self._paused_reason = "scan_too_old_to_submit"
+            return
+        latest_clock, latest_positions, latest_orders = await asyncio.gather(
+            self.alpaca.clock(), self.alpaca.positions(), self.alpaca.orders("open", True)
+        )
+        if not latest_clock.get("is_open") or latest_positions or latest_orders or datetime.now(NY) > last_entry_at:
+            self._paused_reason = "pre_submit_recheck_blocked"
+            return
+        # Reserve the cooldown before sending: a timeout may hide an accepted order.
         self._last_entry_at = now
+        order = await self.alpaca.submit_bracket(payload)
         self._last_order = {
             "id": order.get("id"),
             "client_order_id": order.get("client_order_id"),
@@ -358,7 +438,9 @@ class PaperPilot:
         planned_loss = qty * (limit_price - stop_price)
         if planned_loss > self.config.max_daily_loss / 2:
             raise ValueError("planned trade loss exceeds half the daily loss limit")
-        tag = now.strftime("eli406-%Y%m%d-%H%M%S")
+        # Same session/time bucket has one broker-enforced ID across restarts.
+        bucket = (now.hour * 60 + now.minute) // self.config.cooldown_minutes
+        tag = now.strftime("eli406-%Y%m%d-") + str(bucket)
         return {
             "symbol": signal["symbol"],
             "qty": str(qty),
@@ -377,61 +459,59 @@ class PaperPilot:
         prefix = now.strftime("eli406-%Y%m%d-")
         return [order for order in orders if str(order.get("client_order_id", "")).startswith(prefix)]
 
-    def _tagged_pnl(self, tagged: list[dict[str, Any]], positions: list[dict[str, Any]]) -> float:
-        pnl = 0.0
-        for order in tagged:
-            if order.get("status") != "filled" or not order.get("filled_avg_price"):
-                continue
-            entry = float(order["filled_avg_price"])
-            for leg in order.get("legs") or []:
-                if leg.get("status") == "filled" and leg.get("filled_avg_price"):
-                    pnl += (float(leg["filled_avg_price"]) - entry) * float(leg["filled_qty"])
-        tagged_symbols = {order.get("symbol") for order in tagged}
-        for position in positions:
-            if position.get("symbol") in tagged_symbols:
-                pnl += float(position.get("unrealized_pl", 0))
-        return pnl
+    def _owned_fills(self, tagged, today_orders):
+        exits = [order for order in today_orders if str(order.get("client_order_id", "")).startswith("eli406exit-")]
+        return flatten_orders(tagged + exits)
 
-    async def _flatten_tagged(
-        self,
-        tagged: list[dict[str, Any]],
-        positions: list[dict[str, Any]],
-        open_orders: list[dict[str, Any]],
-    ) -> None:
-        tagged_ids: set[str] = set()
-        remaining_by_symbol: dict[str, float] = {}
-        for order in tagged:
-            tagged_ids.add(str(order.get("id")))
-            symbol = str(order.get("symbol"))
-            filled_entry = float(order.get("filled_qty") or 0)
-            filled_exits = 0.0
-            for leg in order.get("legs") or []:
-                tagged_ids.add(str(leg.get("id")))
-                if leg.get("side") == "sell":
-                    filled_exits += float(leg.get("filled_qty") or 0)
-            remaining_by_symbol[symbol] = remaining_by_symbol.get(symbol, 0.0) + max(
-                0.0, filled_entry - filled_exits
-            )
-        exit_prefix = datetime.now(NY).strftime("eli406exit-%Y%m%d-")
-        open_exit_symbols = {
-            str(order.get("symbol"))
-            for order in open_orders
-            if str(order.get("client_order_id", "")).startswith(exit_prefix)
-        }
-        for order in open_orders:
-            if str(order.get("id")) in tagged_ids:
+    def _tagged_pnl(self, tagged, positions, today_orders=None) -> float:
+        # Filled quantities count even when the remainder was canceled.
+        cash = 0.0
+        for order in self._owned_fills(tagged, today_orders or []):
+            qty = float(order.get("filled_qty") or 0)
+            if qty:
+                price = float(order["filled_avg_price"])
+                cash += qty * price * (1 if order["side"] == "sell" else -1)
+        symbols = {order["symbol"] for order in tagged}
+        for position in positions:
+            if position["symbol"] in symbols:
+                cash += float(position["market_value"])
+        return cash
+
+    async def _flatten_tagged(self, tagged, positions, open_orders) -> None:
+        owned = flatten_orders(tagged)
+        tagged_ids = {str(order["id"]) for order in owned}
+        for order in flatten_orders(open_orders):
+            if str(order["id"]) in tagged_ids:
                 try:
                     await self.alpaca.cancel_order(str(order["id"]))
                 except httpx.HTTPStatusError as exc:
                     if exc.response.status_code != 422:
                         raise
-        if tagged_ids:
-            await asyncio.sleep(0.5)
+        # A successful cancel request is not confirmation. Wait for a later
+        # scan if a parent/leg is still active, then use fresh fills/positions.
+        fresh_open = flatten_orders(await self.alpaca.orders("open", True))
+        if any(str(order["id"]) in tagged_ids for order in fresh_open):
+            raise ValueError("flatten awaiting cancellation confirmation")
+        history = await self.alpaca.today_orders()
+        tagged = self._tagged_parents(history, datetime.now(NY))
+        terminal = {"filled", "canceled", "expired", "rejected"}
+        if any(order["status"] not in terminal for order in flatten_orders(tagged)):
+            raise ValueError("flatten awaiting terminal order history")
+        positions = await self.alpaca.positions()
+        remaining = {}
+        for order in self._owned_fills(tagged, history):
+            qty = float(order.get("filled_qty") or 0)
+            symbol = order["symbol"]
+            remaining[symbol] = remaining.get(symbol, 0.0) + qty * (1 if order["side"] == "buy" else -1)
         for position in positions:
-            symbol = str(position.get("symbol"))
-            if symbol in open_exit_symbols:
+            symbol = position["symbol"]
+            qty = remaining.get(symbol, 0.0)
+            if qty <= 0:
                 continue
-            bot_qty = min(remaining_by_symbol.get(symbol, 0.0), float(position.get("qty") or 0))
-            if bot_qty > 0:
-                client_id = datetime.now(NY).strftime(f"eli406exit-%Y%m%d-{symbol}-%H%M%S")
-                await self.alpaca.submit_flatten(symbol, bot_qty, client_id)
+            if any(order["symbol"] == symbol for order in fresh_open):
+                continue
+            if abs(float(position["qty"]) - qty) > 1e-6:
+                raise ValueError("flatten position ownership mismatch")
+            previous = [o for o in history if str(o.get("client_order_id", "")).startswith("eli406exit-") and o["symbol"] == symbol]
+            client_id = datetime.now(NY).strftime(f"eli406exit-%Y%m%d-{symbol}-") + str(len(previous))
+            await self.alpaca.submit_flatten(symbol, qty, client_id)
